@@ -157,8 +157,15 @@ class GenerationService:
                     f"Время ожидания генерации ({self.timeout_seconds}с) истекло. Попробуйте еще раз."
                 ) from exc
             except Exception as exc:
-                logger.error(f"Gemini chat failed for {request_type} (prompt len: {len(prompt)}): {exc}")
-                raise exc
+                logger.error(
+                    "Gemini chat failed for %s (prompt len: %s): %r (%s)",
+                    request_type,
+                    len(prompt),
+                    exc,
+                    exc.__class__.__name__,
+                    exc_info=True,
+                )
+                raise
 
     async def chat_json_with_validation(
         self,
@@ -184,7 +191,13 @@ class GenerationService:
             except Exception as exc:
                 last_error = exc
                 attempt += 1
-                logger.warning(f"Generation attempt {attempt} failed for {request_type}: {exc}")
+                logger.warning(
+                    "Generation attempt %s failed for %s: %r (%s)",
+                    attempt,
+                    request_type,
+                    exc,
+                    exc.__class__.__name__,
+                )
                 remaining_budget = deadline - time.monotonic()
                 if remaining_budget <= 0:
                     raise RuntimeError(
