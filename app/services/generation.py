@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 import httpx
 import logging
-import random
+import time
 from functools import partial
 from typing import Any, Callable, Optional
 from google import genai
 from app.utils.json_utils import extract_json
 
 logger = logging.getLogger(__name__)
+
+_MAX_RETRY_DELAY_SECONDS = 20 * 60
+_MAX_PROCESSING_BUDGET_SECONDS = 24 * 60 * 60
 
 
 def parse_model_list(raw_models: Optional[str], *, fallback: list[str]) -> list[str]:
@@ -163,10 +166,13 @@ class GenerationService:
         validator: Callable[[Any], None],
         *,
         request_type: str = "unknown",
-        max_retries: int = 3,
+        max_retries: Optional[int] = None,
     ) -> Any:
         last_error: Optional[Exception] = None
-        for attempt in range(max_retries + 1):
+        delay_seconds = 1.0
+        deadline = time.monotonic() + _MAX_PROCESSING_BUDGET_SECONDS
+        attempt = 0
+        while True:
             try:
                 data = await self.chat_json(
                     prompt,
@@ -177,17 +183,19 @@ class GenerationService:
                 return data
             except Exception as exc:
                 last_error = exc
-                logger.warning(f"Generation attempt {attempt + 1} failed for {request_type}: {exc}")
-                if attempt >= max_retries:
+                attempt += 1
+                logger.warning(f"Generation attempt {attempt} failed for {request_type}: {exc}")
+                remaining_budget = deadline - time.monotonic()
+                if remaining_budget <= 0:
                     raise RuntimeError(
-                        f"Не удалось получить корректный JSON ответ после {max_retries + 1} попыток: {exc}"
+                        f"Не удалось получить корректный JSON ответ в пределах {_MAX_PROCESSING_BUDGET_SECONDS // 3600} часов: {exc}"
                     ) from exc
-                # Exponential backoff: 1s, 2s, 4s, 8s...
-                sleep_time = (3 ** attempt) + random.uniform(0, 1)
-                logger.info(f'Retrying in {sleep_time}s... (attempt {attempt + 1})')
+                sleep_time = min(delay_seconds, remaining_budget, _MAX_RETRY_DELAY_SECONDS)
+                logger.info(f"Retrying in {sleep_time:.1f}s... (attempt {attempt})")
                 await asyncio.sleep(sleep_time)
+                delay_seconds = min(delay_seconds * 2, float(_MAX_RETRY_DELAY_SECONDS))
         if last_error is not None:
             raise RuntimeError(
-                f"Не удалось получить корректный JSON ответ после {max_retries + 1} попыток: {last_error}"
+                f"Не удалось получить корректный JSON ответ в пределах {_MAX_PROCESSING_BUDGET_SECONDS // 3600} часов: {last_error}"
             ) from last_error
         return {}

@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 import httpx
 import logging
+import time
 from pathlib import Path
 from typing import Any, Optional
 from groq import AsyncGroq
 from app.schemas import TranscribeChunkJobRequest
 
 logger = logging.getLogger(__name__)
+
+_MAX_RETRY_DELAY_SECONDS = 20 * 60
+_MAX_PROCESSING_BUDGET_SECONDS = 24 * 60 * 60
 
 
 def safe_unlink(path: Path) -> None:
@@ -39,7 +43,10 @@ class TranscriptionService:
 
     async def transcribe_with_retry(self, audio_path: Path) -> Any:
         last_error: Optional[Exception] = None
-        for attempt in range(4):
+        delay_seconds = 1.0
+        deadline = time.monotonic() + _MAX_PROCESSING_BUDGET_SECONDS
+        attempt = 0
+        while True:
             try:
                 if self.transcriber_type == "local":
                     files = {
@@ -73,10 +80,17 @@ class TranscriptionService:
                     )
             except Exception as exc:
                 last_error = exc
-                logger.warning(f"Transcription attempt {attempt + 1} failed: {exc}")
-                if attempt >= 3:
-                    raise
-                await asyncio.sleep(0.25)
+                attempt += 1
+                logger.warning(f"Transcription attempt {attempt} failed: {exc}")
+                remaining_budget = deadline - time.monotonic()
+                if remaining_budget <= 0:
+                    raise RuntimeError(
+                        f"Не удалось выполнить транскрибацию в пределах {_MAX_PROCESSING_BUDGET_SECONDS // 3600} часов: {exc}"
+                    ) from exc
+                sleep_time = min(delay_seconds, remaining_budget, _MAX_RETRY_DELAY_SECONDS)
+                logger.info(f"Retrying transcription in {sleep_time:.1f}s... (attempt {attempt})")
+                await asyncio.sleep(sleep_time)
+                delay_seconds = min(delay_seconds * 2, float(_MAX_RETRY_DELAY_SECONDS))
         if last_error is not None:
             raise last_error
         raise RuntimeError("Не удалось выполнить транскрибацию.")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import pytest
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
@@ -9,6 +10,8 @@ from fastapi.exceptions import RequestValidationError
 
 from app.main import app, reset_groq_service, lifespan, _execute_task, validation_exception_handler
 from app.groq_service import GenerationBackend, GroqService
+from app.services.generation import GenerationService
+from app.services.transcription import TranscriptionService
 from app.prompts import CHUNK_ANALYZE_PROMPT, TEACHER_ANALYSIS_AGGREGATE_PROMPT, TEACHER_AGGREGATE_PART_STRUCTURE_PROMPT, TEACHER_AGGREGATE_PART_ENGAGEMENT_PROMPT, TEACHER_AGGREGATE_PART_FLAGS_PROMPT
 from app.schemas import TeacherAnalysisAggregateRequest, TeacherAnalysisAggregateResponse, ChunkAnalyzeRequest, ChunkAnalyzeResponse
 from app.task_queue import TaskQueueManager
@@ -693,6 +696,67 @@ async def test_transcribe_chunk_speaker_parsing():
     assert res2["transcript"][0]["start_ms"] == 1200
     assert res2["transcript"][0]["text"] == "Hello"
     assert "speaker" not in res2["transcript"][0]
+
+
+@pytest.mark.asyncio
+async def test_transcription_retries_beyond_old_limit_and_caps_delay(tmp_path):
+    service = TranscriptionService(
+        transcriber_type="groq",
+        local_whisper_url="http://localhost:8080/v1",
+        local_whisper_model="whisper-large-v3",
+        groq_client=MagicMock(),
+    )
+    service.groq_client.audio = MagicMock()
+    service.groq_client.audio.transcriptions = MagicMock()
+    service.groq_client.audio.transcriptions.create = AsyncMock(
+        side_effect=[RuntimeError("boom")] * 12 + ["ok"],
+    )
+
+    sleep_mock = AsyncMock()
+    with patch("app.services.transcription.time.monotonic", return_value=0.0), patch(
+        "app.services.transcription.asyncio.sleep",
+        sleep_mock,
+    ):
+        result = await service.transcribe_with_retry(tmp_path / "audio.wav")
+
+    assert result == "ok"
+    assert service.groq_client.audio.transcriptions.create.await_count == 13
+    sleep_values = [call.args[0] for call in sleep_mock.await_args_list]
+    assert sleep_values[:4] == [1.0, 2.0, 4.0, 8.0]
+    assert sleep_values[-1] == 1200
+
+
+@pytest.mark.asyncio
+async def test_generation_retries_beyond_old_limit_and_caps_delay():
+    service = GenerationService(
+        llm_type="local",
+        local_llm_url="http://localhost:11434/v1",
+        local_llm_model="gemma",
+        google_client=None,
+    )
+    service.chat_json = AsyncMock(side_effect=[RuntimeError("boom")] * 12 + [{"ok": True}])
+
+    sleep_mock = AsyncMock()
+
+    def validator(data: Any) -> None:
+        assert data["ok"] is True
+
+    with patch("app.services.generation.time.monotonic", return_value=0.0), patch(
+        "app.services.generation.asyncio.sleep",
+        sleep_mock,
+    ):
+        result = await service.chat_json_with_validation(
+            "prompt",
+            validator,
+            request_type="unit-test",
+            max_retries=0,
+        )
+
+    assert result == {"ok": True}
+    assert service.chat_json.await_count == 13
+    sleep_values = [call.args[0] for call in sleep_mock.await_args_list]
+    assert sleep_values[:4] == [1.0, 2.0, 4.0, 8.0]
+    assert sleep_values[-1] == 1200
 
 
 # ---------------------------------------------------------------------------
